@@ -1,0 +1,1558 @@
+---
+title: "Risk Perception to Coastal Hazards: a global systematic review"
+output: html_notebook
+---
+
+**Figure Code for "Risk Perception to Coastal Hazards: a global systematic review"** 
+
+Figure 1 was generated using Covidence and Microsoft Powerpoint 
+
+Figure 5 was partially generated using ArcGIS Pro. Code is included to produce the csv files that were exported to ArcGIS. 
+
+```{r Loading Packages and Data}
+library(tidyverse)
+library(ggplot2)
+library(scales)
+library(maps)
+library(viridis)
+library(wordcloud)
+library(RColorBrewer)
+library(patchwork)
+library(ggrepel)
+library(ggalluvial)
+library(UpSetR)
+
+data_raw <- read_csv("CLEAN_RiskPerception_Review_final.csv",
+                     show_col_types = FALSE)
+
+data <- data_raw %>%
+  # Drop empty trailing columns
+  select(where(~ !all(is.na(.)))) %>%
+  mutate(Research_Angle = Research_Angle_of_Risk_Perception, Main_drivers = Main_drivers_identified_for_risk_perception) %>% 
+  # Standardize text fields
+  mutate(across(
+    c(Type_of_Hazard, Risk_perception_measurement_type, Broad_Study_Method,
+      country, Participant_Type, Keywords, Research_Angle, Level_of_Analysis,
+      Level_of_Risk_Perception, Body_of_Water, Journal),
+    ~ str_to_lower(str_trim(.))
+  )) %>%
+  # Normalize comma-separated values (remove extra white space around commas)
+  mutate(across(
+    c(Type_of_Hazard, Keywords, Participant_Type, Research_Angle,
+      Level_of_Analysis, Level_of_Risk_Perception, Risk_perception_measurement_type, Body_of_Water, Journal),
+    ~ str_replace_all(., "\\s*,\\s*", ",")
+  )) %>%
+  mutate(
+    country = case_when(
+      country %in% c("united states", "usa") ~ "united states of america",
+      TRUE ~ str_trim(country)
+    ),
+    Level_of_Analysis = case_when(
+      Level_of_Analysis == "individual" ~ "individuals",
+      Level_of_Analysis == "household" ~ "households",
+      TRUE ~ Level_of_Analysis
+    ),
+    Broad_Study_Method = case_when(
+      Broad_Study_Method %in% c("mixed methods", "mixed method") ~ "mixed methods",
+      TRUE ~ Broad_Study_Method
+    ),
+    Risk_perception_measurement_type = case_when(
+      Risk_perception_measurement_type %in% c("focus groups", "focus group") ~ "focus group",
+      Risk_perception_measurement_type %in% c("key informant interviews", "key informant interview") ~ "key informant interviews",
+      Risk_perception_measurement_type %in% c("interview", "interviews") ~ "interview",
+      TRUE ~ Risk_perception_measurement_type
+    ),
+    Participant_Type = if_else(Participant_Type == "general population", "g", Participant_Type),
+    Year_of_Publication = as.integer(Year_of_Publication),
+    Single_or_Multi_Hazard = str_to_upper(Single_or_Multi_Hazard),
+    Single_or_Multiple_Locations = case_when(
+      str_to_lower(Single_or_Multiple_Locations) %in% c("m", "multiple") ~ "M",
+      str_to_lower(Single_or_Multiple_Locations) == "s" ~ "S",
+      TRUE ~ Single_or_Multiple_Locations
+    ), 
+    Research_Angle = case_when( 
+      Research_Angle %in% c("assessment of risk perception level", "assessment of risk perception") ~ "assessment of risk perception level",
+      TRUE ~ Research_Angle
+    ),
+    # Standardize hazard types: combine cyclone with hurricane, remove drought and subsidence
+    Type_of_Hazard = str_replace_all(Type_of_Hazard, "cyclone", "hurricane"),
+    Type_of_Hazard = str_replace_all(Type_of_Hazard, "hurricanes", "hurricane"),
+    Type_of_Hazard = str_split(Type_of_Hazard, ","),
+    Type_of_Hazard = map_chr(Type_of_Hazard, ~ {
+      hazards <- .x[!.x %in% c("drought", "subsidence")]
+      paste(hazards, collapse = ",")
+    }),
+    Type_of_Hazard = if_else(Type_of_Hazard == "", NA_character_, Type_of_Hazard)
+  )
+
+# Canonical allowed hazards (for filtered plots)
+allowed_hazards <- c(
+  "tsunami", "hurricane", "saltwater intrusion", "sea level rise",
+  "erosion", "eutrophication", "storm surge", "pollution", "flooding",
+  "climate change"
+)
+```
+
+
+```{r Helper tools}
+# Split comma-separated column to frequency table
+freq_split <- function(df, col, sep = ",\\s*") {
+  df |>
+    filter(!is.na(.data[[col]])) |>
+    mutate(term = str_split(.data[[col]], sep)) |>
+    unnest(term) |>
+    mutate(term = str_trim(term)) |>
+    filter(term != "", term != "na") |>
+    count(term, sort = TRUE)
+}
+
+# Split comma-separated column and count terms
+count_split <- function(df, col, sep = ",") {
+  df %>%
+    filter(!is.na(.data[[col]])) %>%
+    mutate(term = str_split(.data[[col]], sep)) %>%
+    unnest(term) %>%
+    mutate(term = str_trim(term)) %>%
+    filter(term != "") %>%
+    count(term, sort = TRUE)
+}
+
+# ggplot2 theme for all charts
+theme_lit <- function(base_size = 11) {
+  theme_minimal(base_size = base_size) %+replace%
+    theme(
+      plot.title    = element_text(face = "bold", size = base_size + 1, hjust = 0),
+      plot.subtitle = element_text(size = base_size - 1, color = "grey40", hjust = 0),
+      plot.caption  = element_text(size = base_size - 2, color = "grey55", hjust = 1),
+      axis.title    = element_text(size = base_size - 1),
+      legend.title  = element_text(face = "bold", size = base_size - 1),
+      panel.grid.minor = element_blank()
+    )
+}
+```
+
+
+```{r Figure 2}
+# Create unique study IDs for the duplicate studies
+data_unique <- data %>%
+  group_by(study_id) %>%
+  mutate(study_id_unique = if (n() > 1) {
+    paste0(study_id, "_", row_number())
+  } else {
+    study_id
+  }) %>%
+  ungroup()
+
+# Split comma-separated hazards into long format
+hazard_long <- data_unique %>%
+  separate_rows(Type_of_Hazard, sep = ",\\s*") %>%
+  mutate(Type_of_Hazard = str_trim(Type_of_Hazard)) %>%
+  filter(Type_of_Hazard != "" & !is.na(Type_of_Hazard))
+
+# Check unique values
+unique(hazard_long$Type_of_Hazard)
+
+# Convert to binary matrix
+hazards_matrix <- hazard_long %>%
+  mutate(value = 1) %>%
+  pivot_wider(
+    names_from = Type_of_Hazard,
+    values_from = value,
+    values_fill = 0
+  ) %>%
+  column_to_rownames("study_id_unique")  
+
+# Clean column names
+colnames(hazards_matrix) <- gsub("_", " ", colnames(hazards_matrix))
+
+upset(hazards_matrix,
+      nsets = 10,
+      nintersects = 25,
+      order.by = "freq",
+      decreasing = TRUE,
+      point.size = 3.5,
+      line.size = 1.2,
+      mainbar.y.label = "Number of Studies",
+      sets.x.label = "Studies per Hazard Type",
+      text.scale = c(1.6, 1.4, 1.2, 1.2, 1.6, 1.3),
+      mb.ratio = c(0.65, 0.35),
+      sets.bar.color = "coral3",
+      main.bar.color = "gray30",
+      matrix.color = "gray30",
+      shade.color = "gray90")
+```
+
+```{r Figure 3}
+# Panel A 
+risk_parsed <- data %>%
+  filter(!is.na(Level_of_Risk_Perception)) %>%
+  select(study_id = `study_id`, Year_of_Publication, Type_of_Hazard,
+         Level_of_Risk_Perception) %>%
+  mutate(entry = str_split(Level_of_Risk_Perception, ",")) %>%
+  unnest(entry) %>%
+  mutate(entry = str_trim(entry)) %>%
+  filter(entry != "", entry != "unk") %>%
+  mutate(
+    parts             = str_split(entry, "_"),
+    n_parts           = lengths(parts),
+    risk_level        = purrr::map_chr(parts, 1),
+    rest              = purrr::map(parts, ~ .x[-1]),
+    survey_tok        = purrr::map_chr(rest, ~ {
+      hits <- str_subset(.x, "^s\\d+$")
+      if (length(hits)) hits[1] else NA_character_
+    }),
+    hazard_from_entry = purrr::map_chr(rest, ~ {
+      h <- str_subset(.x, "^s\\d+$", negate = TRUE)
+      if (length(h)) paste(h, collapse = " ") else NA_character_
+    }),
+    unified_hazard = case_when(
+      !is.na(hazard_from_entry) & hazard_from_entry != "" ~ hazard_from_entry,
+      !is.na(Type_of_Hazard) & Type_of_Hazard != ""       ~ Type_of_Hazard,
+      TRUE ~ NA_character_
+    ),
+    risk_level_clean = case_when(
+      str_detect(risk_level, "very.?high|veryhigh") ~ "very high",
+      str_detect(risk_level, "^high$")              ~ "high",
+      str_detect(risk_level, "^mod")                ~ "moderate",
+      str_detect(risk_level, "^low$")               ~ "low",
+      str_detect(risk_level, "very.?low|verylow")   ~ "very low",
+      TRUE                                           ~ risk_level
+    )
+  ) %>%
+  filter(risk_level_clean %in% c("very low", "low", "moderate", "high", "very high")) %>%
+  mutate(unified_hazard = str_split(unified_hazard, ",|/")) %>%
+  unnest(unified_hazard) %>%
+  mutate(
+    unified_hazard = str_trim(unified_hazard),
+    unified_hazard = str_replace_all(unified_hazard, " ", ""),
+    unified_hazard = recode(unified_hazard,
+                            "sealevelrise"       = "sea level rise",
+                            "flooding"           = "flooding",
+                            "floods"             = "flooding",
+                            "cyclones"           = "hurricane",
+                            "erosion"            = "erosion",
+                            "saltwaterintrusion" = "saltwater intrusion",
+                            "saltwaterinstrusion" = "saltwater intrusion",
+                            "hurricane"          = "hurricane",
+                            "tsunami"            = "tsunami",
+                            "climatechange"      = "climate change",
+                            "stormsurge"         = "storm surge",
+                            "stormsurges"       = "storm surge",
+                            "pollution"          = "pollution",
+                            "eutrophication"     = "eutrophication",
+                            "earthquake"         = "earthquake",
+                            .default             = unified_hazard
+    )
+  ) %>%
+  filter(!is.na(unified_hazard), unified_hazard != "") %>%
+  filter(unified_hazard != "earthquake")  # EXCLUDE EARTHQUAKES
+
+# Reverse the order so very low is first (left) and very high is last (right)
+risk_level_order <- c("very high", "high", "moderate", "low", "very low")
+risk_colors <- c(
+  "very low"  = "#2c7bb6",
+  "low"       = "#abd9e9",
+  "moderate"  = "#ffffbf",
+  "high"      = "#fdae61",
+  "very high" = "#d7191c"
+)
+
+risk_by_hazard <- risk_parsed %>%
+  count(unified_hazard, risk_level_clean) %>%
+  mutate(risk_level_clean = factor(risk_level_clean, levels = risk_level_order))
+
+risk_by_hazard_pct <- risk_by_hazard %>%
+  group_by(unified_hazard) %>%
+  mutate(total = sum(n), pct = n / total * 100) %>%
+  ungroup()
+
+# Stacked bar: absolute counts with numbers at the top
+p_risk_stack <- ggplot(risk_by_hazard_pct,
+                       aes(x = reorder(unified_hazard, total),
+                           y = n,
+                           fill = risk_level_clean)) +
+  geom_col(position = "stack") +
+  geom_text(data = risk_by_hazard_pct %>% 
+              group_by(unified_hazard) %>% 
+              summarise(total = sum(n)),
+            aes(x = unified_hazard, y = total, label = total, fill = NULL),
+            hjust = -0.2, 
+            size = 3.5,
+            fontface = "bold") +
+  coord_flip() +
+  scale_fill_manual(values = risk_colors, drop = FALSE) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(
+    title    = "Risk Perception Levels by Hazard Type",
+    subtitle = "Absolute frequency of each risk category",
+    x        = NULL,
+    y        = "Number of Records",
+    fill     = "Risk Level"
+  ) +
+  theme_lit() +
+  theme(legend.position = "bottom") +
+  # This ensures the legend displays in the correct order too
+ guides(fill = guide_legend(reverse = TRUE))
+
+print(p_risk_stack)
+
+# Panel B 
+library(forcats)
+
+# Load the cleaned data
+df <- read.csv("risk_perception_by_hazard_country.csv", stringsAsFactors = FALSE)
+
+# Define ordered risk score factor
+score_levels <- c("very low", "low", "moderate", "high", "very high")
+
+df <- df %>%
+  mutate(
+    risk_score = tolower(trimws(risk_score)),
+    final_hazard = tolower(trimws(final_hazard)),
+    country = trimws(country),
+    risk_score = factor(risk_score, levels = score_levels, ordered = TRUE)
+  )
+
+# Color palette for risk levels (red-yellow-green)
+risk_colours <- c(
+  "very low"  = "#2c7bb6",
+  "low"       = "#abd9e9",
+  "moderate"  = "#ffffbf",
+  "high"      = "#fdae61",
+  "very high" = "#d7191c"
+)
+# Find countries with enough articles to be worth faceting
+countries_to_include <- df %>%
+  separate_rows(country, sep = ",") %>%
+  mutate(country = trimws(country)) %>%
+  group_by(country) %>%
+  summarise(n = n_distinct(study_id), .groups = "drop") %>%
+  filter(n >= 2) %>%
+  pull(country)
+
+riskperception_countries <- df %>%
+  separate_rows(country, sep = ",") %>%
+  mutate(country = trimws(country)) %>%
+  filter(country %in% countries_to_include) %>%
+  mutate(final_hazard = str_to_title(final_hazard)) %>%
+  group_by(country, final_hazard, risk_score) %>%
+  summarise(n = n_distinct(study_id), .groups = "drop") %>%
+  group_by(country, final_hazard) %>%
+  mutate(total = sum(n)) %>%
+  ungroup() %>%
+  ggplot(aes(x = n, y = fct_reorder(final_hazard, total), fill = risk_score)) +
+  geom_bar(stat = "identity", position = "stack", colour = "white", linewidth = 0.3) +
+  scale_fill_manual(values = risk_colours, drop = FALSE,
+                    name = "Risk Perception Level") +
+  scale_x_continuous(breaks = scales::breaks_pretty()) +
+  facet_wrap(~ country, scales = "free_y", ncol = 3) +
+  labs(
+    title = "Risk Perception by Hazard Type, Faceted by Country",
+    subtitle = "Countries with ≥ 2 articles shown",
+    x = "Number of Articles",
+    y = "Hazard Type"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.y = element_text(size = 8),
+    axis.text.x = element_text(size = 8),
+    strip.text = element_text(face = "bold", size = 9),
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(size = 10, colour = "grey40"),
+    legend.key.size = unit(0.8, "lines"),
+    legend.text = element_text(size = 9),
+    # Remove minor grid lines, keep major vertical ones
+    panel.grid.minor.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    panel.grid.major.y = element_blank(),
+    panel.grid.major.x = element_line(colour = "grey80", linewidth = 0.5)
+  )
+
+print(riskperception_countries)
+```
+
+
+```{r Figure 4}
+# Panel A 
+# Annual publication counts with 3-year rolling mean
+year_freq <- data %>%
+  filter(!is.na(Year_of_Publication)) %>%
+  count(Year_of_Publication) %>%
+  arrange(Year_of_Publication) %>%
+  mutate(rolling_mean = zoo::rollmean(n, k = 3, fill = NA, align = "center"))
+
+if (!requireNamespace("zoo", quietly = TRUE)) {
+  install.packages("zoo", repos = "https://cloud.r-project.org")
+}
+
+year_freq <- data %>%
+  filter(!is.na(Year_of_Publication)) %>%
+  count(Year_of_Publication) %>%
+  arrange(Year_of_Publication) %>%
+  mutate(rolling_mean = rollmean(n, k = 3, fill = NA, align = "center"))
+
+year_pub <- ggplot(year_freq, aes(x = Year_of_Publication, y = n)) +
+  geom_col(fill = "#2166AC", alpha = 0.75, width = 0.8) +
+  geom_text(aes(label = n), nudge_y = 0.5, size = 3.5) +
+  geom_line(aes(y = rolling_mean), color = "#D6604D", linewidth = 1, na.rm = TRUE) +
+  geom_point(aes(y = rolling_mean), color = "#D6604D", size = 2, na.rm = TRUE) +
+  scale_x_continuous(breaks = seq(min(year_freq$Year_of_Publication, na.rm = TRUE),
+                                  max(year_freq$Year_of_Publication, na.rm = TRUE), by = 2)) +
+  scale_y_continuous(breaks = scales::breaks_pretty()) +
+  labs(
+    title    = "Annual Publication Output",
+    subtitle = "Bars = annual count; red line = 3-year rolling mean",
+    x        = "Year of Publication",
+    y        = "Number of Studies"
+  ) +
+  theme_lit()
+
+print(year_pub)
+
+# Panel B 
+n_drv_na <- sum(is.na(data$Main_drivers) | 
+                  tolower(str_trim(data$Main_drivers)) %in% c("unk", "unknown", "na", ""))
+
+# Start from the original data, not from count_split
+drv <- data %>%
+  filter(!is.na(Main_drivers), 
+         !tolower(str_trim(Main_drivers)) %in% c("unk", "unknown", "na", "")) %>%
+  mutate(term = str_split(Main_drivers, ",")) %>%
+  unnest(term) %>%
+  mutate(term = str_trim(term)) %>%
+  # Now split on period for entries like "policy. experience"
+  mutate(term = str_split(term, "\\.\\s*")) %>%
+  unnest(term) %>%
+  mutate(term = str_trim(term)) %>%
+  # Remove any empty strings
+  filter(term != "") %>%
+  # Standardize terms
+  mutate(term_clean = case_when(
+    tolower(term) %in% c("demographic", "demographics") ~ "demographic",
+    tolower(term) %in% c("spatial") ~ "spatial",
+    tolower(term) %in% c("experience") ~ "experience", 
+    tolower(term) %in% c("policy") ~ "policy",
+    tolower(term) %in% c("belief systems", "belief system") ~ "belief system",
+    TRUE ~ tolower(term)
+  )) %>%
+  # Count unique studies per term
+  count(term_clean, name = "n") %>%
+  rename(term = term_clean)
+
+N <- nrow(data) 
+
+drivers <- ggplot(drv, aes(x = reorder(term, n), y = n)) +
+  geom_col(fill = "#8E44AD", alpha = 0.80) +
+  geom_text(aes(label = n), hjust = -0.2, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.22))) +
+  labs(
+    title    = "Main Drivers of Risk Perception",
+    subtitle = paste0(n_drv_na, " of ", N, " studies (",
+                      round(n_drv_na / N * 100, 1),
+                      "%) did not report main drivers"),
+    x = NULL, y = "Frequency" ) +
+  theme_lit()
+
+print(drivers)
+
+# Panel C 
+# Level of analysis
+loa_freq <- count_split(data, "Level_of_Analysis")
+
+loa <- ggplot(loa_freq, aes(x = reorder(term, n), y = n)) +
+  geom_col(fill = "#9ECAE1", alpha = 0.9) +
+  geom_text(aes(label = n), hjust = -0.2, size = 3.5) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title = "Level of Analysis",
+    x     = NULL,
+    y     = "Number of Studies"
+  ) +
+  theme_lit()
+
+print(loa)
+
+# Panel D 
+data_unique <- data %>%
+  group_by(study_id) %>%
+  mutate(study_id_unique = if (n() > 1) {
+    paste0(study_id, "_", row_number())
+  } else {
+    study_id
+  }) %>%
+  ungroup()
+
+# Split comma-separated research angles into long format
+research_long <- data_unique %>%
+  separate_rows(Research_Angle, sep = ",\\s*") %>%
+  mutate(Research_Angle = str_trim(Research_Angle)) %>%
+  filter(Research_Angle != "" & !is.na(Research_Angle)) %>%
+  # RECODE AFTER SPLITTING - this is the key fix
+  mutate(Research_Angle = case_when(
+    Research_Angle == "assessment of risk perception" ~ "assessment of risk perception level",
+    TRUE ~ Research_Angle
+  ))
+
+# Check unique values - should now be combined
+unique(research_long$Research_Angle)
+
+# Convert to binary matrix - now each study (row) can have multiple angles (1s in multiple columns)
+research_matrix <- research_long %>%
+  mutate(value = 1) %>%
+  pivot_wider(
+    names_from = Research_Angle,
+    values_from = value,
+    values_fill = 0,
+    values_fn = list(value = max)  # If a study has the same angle listed twice, take max
+  ) %>%
+  column_to_rownames("study_id_unique")
+
+# First, clean the column names to remove underscores
+colnames(research_matrix) <- gsub("_", " ", colnames(research_matrix))
+
+# Create the upset plot with show.numbers parameter
+upset(research_matrix,
+      nsets = ncol(research_matrix),
+      nintersects = 20,
+      order.by = "freq",
+      decreasing = TRUE,
+      point.size = 4,
+      line.size = 1.5,
+      mainbar.y.label = "Number of Studies",
+      sets.x.label = "Studies per Research Angle",
+      text.scale = c(1.8, 1.5, 1.3, 1.3, 1.8, 1.5),
+      mb.ratio = c(0.65, 0.35),
+      sets.bar.color = "steelblue",
+      main.bar.color = "gray30",
+      matrix.color = "gray30",
+      shade.color = "gray90",
+      show.numbers = "yes")  
+
+```
+
+```{r Figure 5}
+# CSVs for ArcGIS Pro 
+# ----- DATA CLEANING -----------------------------------------------------------
+data <- data_raw %>%
+  # Drop empty trailing columns
+  select(where(~ !all(is.na(.)))) %>%
+  # Standardize country names
+  mutate(
+    country = str_to_lower(str_trim(country)),
+    country = case_when(
+      country %in% c("united states", "usa") ~ "united states of america",
+      country %in% c("uk") ~ "united kingdom",
+      TRUE ~ country
+    ),
+    # Standardize hazard types to lowercase
+    Type_of_Hazard = str_to_lower(str_trim(Type_of_Hazard))
+  )
+
+# ----- ALL STUDIES (NO FILTER) -------------------------------------------------
+all_studies <- data %>%
+  filter(!is.na(country)) %>%
+  select(everything())
+
+# ----- CALCULATE HAZARD FREQUENCIES (ALL COUNTRIES) ----------------------------
+all_hazard_freq <- all_studies %>%
+  filter(!is.na(Type_of_Hazard)) %>%
+  # Split comma-separated hazards
+  mutate(hazard_list = str_split(Type_of_Hazard, ",")) %>%
+  unnest(hazard_list) %>%
+  mutate(hazard_list = str_trim(hazard_list)) %>%
+  count(hazard_list, name = "frequency") %>%
+  arrange(desc(frequency))
+
+# ----- CALCULATE HAZARD FREQUENCIES BY COUNTRY ---------------------------------
+hazard_freq_by_country <- all_studies %>%
+  filter(!is.na(Type_of_Hazard), !is.na(country)) %>%
+  # Split countries
+  mutate(country_list = str_split(country, ",")) %>%
+  unnest(country_list) %>%
+  mutate(country_list = str_trim(country_list)) %>%
+  # Split hazards
+  mutate(hazard_list = str_split(Type_of_Hazard, ",")) %>%
+  unnest(hazard_list) %>%
+  mutate(hazard_list = str_trim(hazard_list)) %>%
+  # Count by country and hazard
+  count(country_list, hazard_list, name = "frequency") %>%
+  arrange(country_list, desc(frequency))
+
+# ----- COUNTRY SUMMARY ---------------------------------------------------------
+country_summary <- all_studies %>%
+  # Expand multi-country studies
+  mutate(country_list = str_split(country, ",")) %>%
+  unnest(country_list) %>%
+  mutate(country_list = str_trim(country_list)) %>%
+  group_by(country_list) %>%
+  summarise(
+    n_studies = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(n_studies))
+
+# ----- CREATE ENHANCED DATASET WITH FREQUENCIES --------------------------------
+all_studies_with_freq <- all_studies %>%
+  mutate(
+    # Split hazards
+    hazard_list = str_split(Type_of_Hazard, ",")
+  ) %>%
+  unnest(hazard_list) %>%
+  mutate(hazard_list = str_trim(hazard_list)) %>%
+  # Join with frequency data
+  left_join(all_hazard_freq, by = "hazard_list") %>%
+  # Create hazard with frequency label
+  mutate(hazard_with_freq = paste0(hazard_list, " (n=", frequency, ")")) %>%
+  # Group back to one row per study
+  group_by(across(-c(hazard_list, frequency, hazard_with_freq))) %>%
+  summarise(
+    all_hazards = paste(hazard_list, collapse = ", "),
+    hazards_with_frequencies = paste(hazard_with_freq, collapse = "; "),
+    .groups = "drop"
+  )
+
+# ----- PRINT SUMMARY -----------------------------------------------------------
+cat("\n========================================\n")
+cat("COASTAL RISK PERCEPTION STUDIES - GLOBAL SUMMARY\n")
+cat("========================================\n\n")
+cat("Total studies:", nrow(all_studies), "\n")
+cat("Total countries represented:", nrow(country_summary), "\n")
+cat("Unique hazard types:", nrow(all_hazard_freq), "\n\n")
+
+cat("OVERALL HAZARD TYPE FREQUENCIES:\n")
+cat("--------------------------------\n")
+print(all_hazard_freq, n = Inf)
+
+cat("\n\nTOP 15 COUNTRIES BY NUMBER OF STUDIES:\n")
+cat("--------------------------------------\n")
+print(country_summary %>% head(15), n = 15)
+
+# ----- EXPORT TO CSV -----------------------------------------------------------
+write_csv(all_studies, "all_coastal_risk_studies.csv")
+write_csv(all_hazard_freq, "hazard_frequencies_global.csv")
+write_csv(hazard_freq_by_country, "hazard_frequencies_by_country.csv")
+write_csv(country_summary, "country_summary.csv")
+write_csv(all_studies_with_freq, "all_studies_with_hazard_frequencies.csv")
+
+cat("\n✓ Files created successfully:\n")
+cat("  1. all_coastal_risk_studies.csv - All studies with original columns\n")
+cat("  2. hazard_frequencies_global.csv - Global hazard frequency table\n")
+cat("  3. hazard_frequencies_by_country.csv - Hazard frequencies broken down by country\n")
+cat("  4. country_summary.csv - Summary of studies per country\n")
+cat("  5. all_studies_with_hazard_frequencies.csv - All studies with frequencies embedded\n\n")
+
+# Bar plots 
+country_studies <- data %>%
+  filter(!is.na(country)) %>%
+  mutate(country_list = str_split(country, ",")) %>%
+  unnest(country_list) %>%
+  mutate(country_list = str_trim(country_list)) %>%
+  # Standardize country names
+  mutate(country_list = case_when(
+    str_detect(country_list, "province of china") ~ "china",
+    TRUE ~ country_list
+  )) %>%
+  count(country_list, name = "n_studies")
+
+# Define region mapping
+country_to_region <- tribble(
+  ~country_list,                     ~region,
+  "united states of america",        "North America",
+  "usa",                             "North America",
+  "canada",                          "North America",
+  "mexico",                          "North America",
+  
+  "brazil",                          "South America",
+  "chile",                           "South America",
+  "argentina",                       "South America",
+  "peru",                            "South America",
+  "colombia",                        "South America",
+  "ecuador",                         "South America",
+  "uruguay",                         "South America",
+  "venezuela",                       "South America",
+  
+  "uk",                              "Europe",
+  "united kingdom",                  "Europe",
+  "france",                          "Europe",
+  "germany",                         "Europe",
+  "spain",                           "Europe",
+  "italy",                           "Europe",
+  "portugal",                        "Europe",
+  "netherlands",                     "Europe",
+  "belgium",                         "Europe",
+  "denmark",                         "Europe",
+  "sweden",                          "Europe",
+  "norway",                          "Europe",
+  "finland",                         "Europe",
+  "poland",                          "Europe",
+  "greece",                          "Europe",
+  "ireland",                         "Europe",
+  "switzerland",                     "Europe",
+  "austria",                         "Europe",
+  "iceland",                         "Europe",
+  "the netherlands",                 "Europe", 
+  
+  "china",                           "Asia",
+  "japan",                           "Asia",
+  "india",                           "Asia",
+  "south korea",                     "Asia",
+  "indonesia",                       "Asia",
+  "thailand",                        "Asia",
+  "vietnam",                         "Asia",
+  "philippines",                     "Asia",
+  "malaysia",                        "Asia",
+  "singapore",                       "Asia",
+  "bangladesh",                      "Asia",
+  "pakistan",                        "Asia",
+  "sri lanka",                       "Asia",
+  "myanmar",                         "Asia",
+  "cambodia",                        "Asia",
+  "taiwan",                          "Asia",
+  
+  "australia",                       "Oceania",
+  "new zealand",                     "Oceania",
+  "fiji",                            "Oceania",
+  "papua new guinea",                "Oceania",
+  "new caledonia",                   "Oceania",
+  "solomon islands",                 "Oceania",
+  "vanuatu",                         "Oceania",
+  "samoa",                           "Oceania",
+  "tonga",                           "Oceania",
+  "french polynesia",                "Oceania",
+  
+  "south africa",                    "Africa",
+  "nigeria",                         "Africa",
+  "egypt",                           "Africa",
+  "kenya",                           "Africa",
+  "tanzania",                        "Africa",
+  "ghana",                           "Africa",
+  "morocco",                         "Africa",
+  "tunisia",                         "Africa",
+  "senegal",                         "Africa",
+  "ivory coast",                     "Africa",
+  "mozambique",                      "Africa",
+  "madagascar",                      "Africa",
+  "cameroon",                        "Africa",
+  "benin",                           "Africa",
+  "angola",                          "Africa",
+  
+  "trinidad and tobago",             "Caribbean",
+  "jamaica",                         "Caribbean",
+  "barbados",                        "Caribbean",
+  "bahamas",                         "Caribbean",
+  "saint kitts and nevis",           "Caribbean",
+  "antigua and barbuda",             "Caribbean",
+  "dominica",                        "Caribbean",
+  "saint lucia",                     "Caribbean",
+  "grenada",                         "Caribbean",
+  "cuba",                            "Caribbean",
+  "haiti",                           "Caribbean",
+  "dominican republic",              "Caribbean",
+  "guadeloupe",                      "Caribbean",
+  "st. vincent and the grenadines",  "Caribbean",
+  "saint vincent and the grenadines", "Caribbean",
+  
+  "saudi arabia",                    "Middle East",
+  "united arab emirates",            "Middle East",
+  "qatar",                           "Middle East",
+  "kuwait",                          "Middle East",
+  "oman",                            "Middle East",
+  "bahrain",                         "Middle East",
+  "israel",                          "Middle East",
+  "jordan",                          "Middle East",
+  "lebanon",                         "Middle East",
+  "turkey",                          "Middle East", 
+  "iran",                            "Middle East"
+)
+
+# Create region color palette
+region_colors <- c(
+  "North America" = "#1f77b4",
+  "South America" = "#ff7f0e",
+  "Europe"        = "#2ca02c",
+  "Asia"          = "#d62728",
+  "Oceania"       = "#9467bd",
+  "Africa"        = "#8c564b",
+  "Caribbean"     = "#e377c2",
+  "Middle East"   = "#7f7f7f",
+  "Other"         = "#bcbd22"
+)
+
+# Join countries with regions
+country_studies_with_region <- country_studies %>%
+  left_join(country_to_region, by = "country_list") %>%
+  mutate(region = if_else(is.na(region), "Other", region))
+
+# Calculate region totals
+region_totals <- country_studies_with_region %>%
+  group_by(region) %>%
+  summarise(total_studies = sum(n_studies), .groups = "drop") %>%
+  arrange(desc(total_studies))
+
+print(region_totals)
+
+# Bar chart by region (overview)
+p_regions <- region_totals %>%
+  ggplot(aes(x = reorder(region, total_studies), y = total_studies, fill = region)) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = total_studies), hjust = -0.2, size = 3.5) +
+  coord_flip() +
+  scale_fill_manual(values = region_colors) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title    = "Distribution of Studies by Global Region",
+    subtitle = "Multi-country studies counted in each region",
+    x        = NULL,
+    y        = "Number of Studies"
+  ) +
+  theme_lit()
+
+print(p_regions)
+
+# prepare individual plots 
+
+# Prepare country-level data with regions
+country_region_data <- country_studies_with_region %>%
+  mutate(country_label = str_to_title(country_list))
+
+# Function to create a bar plot for a specific region
+plot_region_countries <- function(region_name, data = country_region_data) {
+  
+  region_data <- data %>%
+    filter(region == region_name) %>%
+    arrange(desc(n_studies))
+  
+  if (nrow(region_data) == 0) {
+    message(paste("No data for region:", region_name))
+    return(NULL)
+  }
+  
+  region_color <- region_colors[[region_name]]
+  total        <- sum(region_data$n_studies)
+  n_countries  <- nrow(region_data)
+  
+  # Dynamically adjust plot height via aspect ratio hint (for saving)
+  bar_height <- max(4, n_countries * 0.45)
+  
+  p <- region_data %>%
+    mutate(country_label = fct_reorder(country_label, n_studies)) %>%
+    ggplot(aes(
+      x    = country_label,
+      y    = n_studies
+    )) +
+    geom_col(fill = region_color, alpha = 0.85, width = 0.7) +
+    geom_text(
+      aes(label = n_studies),
+      hjust    = -0.2,
+      size     = 3.8,
+      fontface = "bold",
+      color    = "grey30"
+    ) +
+    coord_flip() +
+    scale_y_continuous(
+      expand = expansion(mult = c(0, 0.2)),
+      breaks = scales::pretty_breaks(n = 5)
+    ) +
+    labs(
+      title    = paste0(region_name, " — Studies by Country"),
+      subtitle = paste0("Total: ", total, " studies | ",
+                        n_countries, " countries represented"),
+      x        = NULL,
+      y        = "Number of Studies"
+    ) +
+    theme_lit() +
+    theme(
+      plot.title         = element_text(face = "bold", size = 14,
+                                        color = region_color),
+      plot.subtitle      = element_text(size = 10, color = "grey40"),
+      axis.text.y        = element_text(size = 11),
+      axis.text.x        = element_text(size = 10),
+      panel.grid.major.y = element_blank(),
+      panel.grid.major.x = element_line(color = "grey90", linetype = "dashed"),
+      plot.margin        = margin(15, 20, 15, 15)
+    )
+  
+  return(list(plot = p, height = bar_height))
+}
+
+regions_present <- country_region_data %>%
+  filter(!is.na(region)) %>%
+  distinct(region) %>%
+  arrange(region) %>%
+  pull(region)
+
+for (reg in regions_present) {
+  result <- plot_region_countries(reg)
+  if (!is.null(result)) {
+    print(result$plot)
+  }
+}
+
+```
+
+
+```{r Figure 6}
+count_journals <- function(df, column_name) {
+  df %>%
+    filter(!is.na(.data[[column_name]]), .data[[column_name]] != "") %>%
+    count(.data[[column_name]], name = "n") %>%
+    rename(term = !!column_name) %>%
+    arrange(desc(n))
+}
+
+# compute_shannon function with variance calculation
+compute_shannon <- function(df, period_label) {
+  journal_counts <- count_journals(df, "Journal")
+  total_pubs     <- sum(journal_counts$n)
+  
+  if (total_pubs == 0 || nrow(journal_counts) == 0) {
+    message(sprintf("No publications found for %s", period_label))
+    return(NULL)
+  }
+  
+  journal_counts <- journal_counts %>%
+    mutate(p = n / total_pubs)
+  
+  shannon_H <- -sum(journal_counts$p * log(journal_counts$p))
+  
+  # Calculate variance for Hutcheson's t-test
+  sum_p_lnp_sq <- sum(journal_counts$p * (log(journal_counts$p))^2)
+  sum_p_lnp <- sum(journal_counts$p * log(journal_counts$p))
+  S <- nrow(journal_counts)  # number of species (journals)
+  
+  var_H <- (sum_p_lnp_sq - sum_p_lnp^2) / total_pubs + (S - 1) / (2 * total_pubs^2)
+  
+  list(
+    period       = period_label,
+    shannon_H    = shannon_H,
+    var_H        = var_H,
+    se_H         = sqrt(var_H),
+    n_journals   = nrow(journal_counts),
+    total_pubs   = total_pubs,
+    journal_data = journal_counts
+  )
+}
+
+# Get range of years
+year_range <- data %>%
+  filter(!is.na(Year_of_Publication)) %>%
+  pull(Year_of_Publication) %>%
+  range()
+
+years <- seq(year_range[1], year_range[2])
+
+# Calculate Shannon diversity for each year
+shannon_yearly <- map_dfr(years, function(yr) {
+  data_year <- data %>% filter(Year_of_Publication == yr)
+  result <- compute_shannon(data_year, as.character(yr))
+  
+  if (!is.null(result)) {
+    tibble(
+      Year = yr,
+      Shannon_H = result$shannon_H,
+      Variance = result$var_H,
+      SE = result$se_H,
+      N_Journals = result$n_journals,
+      N_Pubs = result$total_pubs
+    )
+  } else {
+    tibble(
+      Year = yr,
+      Shannon_H = NA_real_,
+      Variance = NA_real_,
+      SE = NA_real_,
+      N_Journals = 0,
+      N_Pubs = 0
+    )
+  }
+})
+
+# Remove years with no data
+shannon_yearly <- shannon_yearly %>%
+  filter(!is.na(Shannon_H), N_Pubs > 0)
+
+# Print summary
+cat("\n============================================================\n")
+cat("SHANNON DIVERSITY INDEX BY YEAR\n")
+cat("============================================================\n")
+print(shannon_yearly)
+
+# Linear regression to test for trend over time
+if (nrow(shannon_yearly) > 2) {
+  trend_model <- lm(Shannon_H ~ Year, data = shannon_yearly)
+  trend_summary <- summary(trend_model)
+  
+  cat("\n============================================================\n")
+  cat("TREND ANALYSIS: Linear Regression of Shannon H' over Time\n")
+  cat("============================================================\n")
+  cat(sprintf("Slope (change per year): %.6f\n", coef(trend_model)[2]))
+  cat(sprintf("R-squared: %.4f\n", trend_summary$r.squared))
+  cat(sprintf("p-value: %.4f\n", trend_summary$coefficients[2, 4]))
+  
+  if (trend_summary$coefficients[2, 4] < 0.05) {
+    if (coef(trend_model)[2] > 0) {
+      cat("RESULT: Significant INCREASING trend in journal diversity over time ***\n")
+    } else {
+      cat("RESULT: Significant DECREASING trend in journal diversity over time ***\n")
+    }
+  } else {
+    cat("RESULT: No significant trend in journal diversity over time (ns)\n")
+  }
+  cat("============================================================\n\n")
+}
+
+# Pairwise Hutcheson's t-tests between consecutive years
+hutcheson_pairwise <- map_dfr(1:(nrow(shannon_yearly) - 1), function(i) {
+  year1 <- shannon_yearly$Year[i]
+  year2 <- shannon_yearly$Year[i + 1]
+  
+  H1 <- shannon_yearly$Shannon_H[i]
+  H2 <- shannon_yearly$Shannon_H[i + 1]
+  var_H1 <- shannon_yearly$Variance[i]
+  var_H2 <- shannon_yearly$Variance[i + 1]
+  n1 <- shannon_yearly$N_Pubs[i]
+  n2 <- shannon_yearly$N_Pubs[i + 1]
+  
+  # Hutcheson's t-statistic
+  t_stat <- (H2 - H1) / sqrt(var_H1 + var_H2)
+  
+  # Degrees of freedom
+  df <- (var_H1 + var_H2)^2 / (var_H1^2 / n1 + var_H2^2 / n2)
+  
+  # Two-tailed p-value
+  p_value <- 2 * pt(-abs(t_stat), df = df)
+  
+  diff_H <- H2 - H1
+  
+  tibble(
+    Year_Comparison = sprintf("%d vs %d", year1, year2),
+    Year_Mid = mean(c(year1, year2)),
+    Year1 = year1,
+    Year2 = year2,
+    H_Diff = diff_H,
+    t_statistic = t_stat,
+    df = df,
+    p_value = p_value,
+    Significant = p_value < 0.05
+  )
+})
+
+print(hutcheson_pairwise)
+
+# Count significant changes
+n_significant <- sum(hutcheson_pairwise$Significant)
+cat(sprintf("\nNumber of significant year-to-year changes: %d out of %d comparisons (%.1f%%)\n",
+            n_significant, nrow(hutcheson_pairwise), 
+            100 * n_significant / nrow(hutcheson_pairwise)))
+
+# Hutcheson's t-test comparing first half vs second half of time period
+midpoint_year <- floor(median(shannon_yearly$Year))
+data_early <- data %>% filter(Year_of_Publication < midpoint_year)
+data_late <- data %>% filter(Year_of_Publication >= midpoint_year)
+
+result_early <- compute_shannon(data_early, sprintf("Early period (<%d)", as.integer(midpoint_year)))
+result_late <- compute_shannon(data_late, sprintf("Late period (>=%d)", as.integer(midpoint_year)))
+
+if (!is.null(result_early) && !is.null(result_late)) {
+  
+  H1 <- result_early$shannon_H
+  H2 <- result_late$shannon_H
+  var_H1 <- result_early$var_H
+  var_H2 <- result_late$var_H
+  
+  # Hutcheson's t-statistic
+  t_stat <- abs(H1 - H2) / sqrt(var_H1 + var_H2)
+  
+  # Degrees of freedom
+  df <- (var_H1 + var_H2)^2 / (var_H1^2 / result_early$total_pubs + 
+                                 var_H2^2 / result_late$total_pubs)
+  
+  # Two-tailed p-value
+  p_value <- 2 * pt(-abs(t_stat), df = df)
+  
+  diff_H <- H2 - H1
+  pct_change <- (diff_H / H1) * 100
+  
+  if (p_value < 0.001) {
+    sig_label <- "***"
+  } else if (p_value < 0.01) {
+    sig_label <- "**"
+  } else if (p_value < 0.05) {
+    sig_label <- "*"
+  } else {
+    sig_label <- "ns"
+  }
+  
+  cat("\n============================================================\n")
+  cat("HUTCHESON'S T-TEST: Early vs Late Period\n")
+  cat("============================================================\n")
+  message(sprintf("H' difference (Late minus Early): %+.4f (%.1f%% change)", diff_H, pct_change))
+  message(sprintf("t-statistic: %.4f", t_stat))
+  message(sprintf("Degrees of freedom: %.2f", df))
+  message(sprintf("p-value: %.4f %s", p_value, sig_label))
+  cat("============================================================\n\n")
+}
+
+# Visualization: Time series plot with Shannon diversity
+p_shannon_time <- ggplot(shannon_yearly, aes(x = Year, y = Shannon_H)) +
+  geom_line(color = "#3498DB", linewidth = 1) +
+  geom_point(aes(size = N_Pubs), color = "#3498DB", alpha = 0.7) +
+  geom_ribbon(aes(ymin = Shannon_H - SE, ymax = Shannon_H + SE), 
+              alpha = 0.2, fill = "#3498DB") +
+  geom_smooth(method = "lm", se = TRUE, color = "#E74C3C", 
+              linetype = "dashed", linewidth = 0.8) +
+  scale_size_continuous(name = "Publications", range = c(2, 8)) +
+  labs(
+    title = "Shannon Diversity Index of Journals Over Time",
+    subtitle = sprintf("Linear trend: slope = %.4f/year, R² = %.3f, p = %.4f",
+                       coef(trend_model)[2], 
+                       summary(trend_model)$r.squared,
+                       summary(trend_model)$coefficients[2, 4]),
+    x = "Year",
+    y = "Shannon Diversity Index (H')",
+    caption = "Point size indicates number of publications; shaded area shows ±1 SE; dashed line shows linear trend"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(color = "grey45", size = 9),
+    plot.caption = element_text(color = "grey55", size = 8, hjust = 0),
+    legend.position = "right"
+  )
+
+print(p_shannon_time)
+
+# Visualization: Hutcheson's t-test results over time
+p_hutcheson <- ggplot(hutcheson_pairwise, aes(x = Year_Mid, y = t_statistic)) +
+  geom_hline(yintercept = c(-1.96, 1.96), linetype = "dashed", color = "red", alpha = 0.5) +
+  geom_line(color = "#2C3E50", linewidth = 0.8) +
+  geom_point(aes(color = Significant, size = abs(t_statistic)), alpha = 0.8) +
+  scale_color_manual(values = c("FALSE" = "#95A5A6", "TRUE" = "#E74C3C"),
+                     labels = c("Not Significant", "Significant (p < 0.05)"),
+                     name = "Statistical Significance") +
+  scale_size_continuous(range = c(2, 6), guide = "none") +
+  labs(
+    title = "Hutcheson's t-test Statistics for Year-to-Year Changes",
+    subtitle = "Comparing Shannon diversity between consecutive years (dashed lines show ±1.96 critical value)",
+    x = "Year",
+    y = "Hutcheson's t-statistic",
+    caption = "Positive values indicate increasing diversity; negative values indicate decreasing diversity"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(color = "grey45", size = 9),
+    plot.caption = element_text(color = "grey55", size = 8, hjust = 0),
+    legend.position = "bottom"
+  )
+
+print(p_hutcheson)
+
+# Visualization: p-values over time
+p_pvalues <- ggplot(hutcheson_pairwise, aes(x = Year_Mid, y = p_value)) +
+  geom_hline(yintercept = 0.05, linetype = "dashed", color = "red", linewidth = 0.8) +
+  geom_line(color = "#2C3E50", linewidth = 0.8) +
+  geom_point(aes(color = Significant), size = 3, alpha = 0.8) +
+  scale_color_manual(values = c("FALSE" = "#95A5A6", "TRUE" = "#E74C3C"),
+                     labels = c("Not Significant", "Significant"),
+                     name = "") +
+  scale_y_continuous(trans = "log10") +
+  labs(
+    title = "Statistical Significance of Year-to-Year Diversity Changes",
+    subtitle = "p-values from Hutcheson's t-tests (log scale)",
+    x = "Year",
+    y = "p-value (log scale)",
+    caption = "Values below red line (p < 0.05) indicate significant changes"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(color = "grey45", size = 9),
+    plot.caption = element_text(color = "grey55", size = 8, hjust = 0),
+    legend.position = "bottom"
+  )
+
+```
+
+
+```{r Extra Calculations}
+# Journal Frequency 
+journal_freq <- count_journals(data, "Journal") %>%  
+  slice_head(n = 10)
+
+p_journal <- ggplot(journal_freq, aes(x = reorder(term, n), y = n)) +
+  geom_col(fill = "#8C564B", alpha = 0.85) +
+  geom_text(aes(label = n), hjust = -0.2, size = 3) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title    = "Top 10 Journals by Publication Count",
+    x        = NULL,
+    y        = "Number of Studies"
+  ) +
+  theme_lit(base_size = 9)
+
+print(p_journal)
+
+# Hazard frequency in top 5 countries 
+country_hazard_studies <- data %>%
+  filter(!is.na(country), !is.na(Type_of_Hazard)) %>%
+  
+  # Expand multi-country entries
+  mutate(country_list = str_split(country, ",")) %>%
+  unnest(country_list) %>%
+  mutate(
+    country_list = str_trim(tolower(country_list)),
+    country_list = case_when(
+      str_detect(country_list, "province of china") ~ "china",
+      TRUE                                          ~ country_list
+    )
+  ) %>%
+  
+  # Expand multi-hazard entries
+  mutate(hazard_list = str_split(Type_of_Hazard, ",")) %>%
+  unnest(hazard_list) %>%
+  mutate(hazard_list = str_trim(tolower(hazard_list))) %>%
+  filter(
+    !is.na(country_list), country_list != "",
+    !is.na(hazard_list),  hazard_list  != "", hazard_list != "na"
+  ) %>%
+  mutate(
+    hazard_list = case_when(
+      
+      # Storm surge
+      hazard_list %in% c(
+        "storm surge", "storm surges", "storm-surge",
+        "stormsurge", "surge"
+      )                                             ~ "storm surge",
+      
+      # Flooding
+      hazard_list %in% c(
+        "flood", "floods", "flooding",
+        "coastal flood", "coastal flooding"
+      )                                             ~ "flooding",
+      
+      # Hurricane
+      hazard_list %in% c(
+        "hurricane", "hurricanes",
+        "tropical storm", "tropical storms"
+      )                                             ~ "hurricane",
+      
+      # Sea level rise
+      hazard_list %in% c(
+        "sea level rise", "sea-level rise",
+        "sea level change", "slr"
+      )                                             ~ "sea level rise",
+      
+      # Erosion
+      hazard_list %in% c(
+        "erosion", "coastal erosion",
+        "shoreline erosion", "beach erosion"
+      )                                             ~ "erosion",
+      
+      # Tsunami
+      hazard_list %in% c(
+        "tsunami", "tsunamis"
+      )                                             ~ "tsunami",
+      
+      # Cyclone
+      hazard_list %in% c(
+        "cyclone", "cyclones",
+        "tropical cyclone", "tropical cyclones"
+      )                                             ~ "cyclone",
+      
+      # Typhoon
+      hazard_list %in% c(
+        "typhoon", "typhoons"
+      )                                             ~ "typhoon",
+      
+      # Keep everything else as-is
+      TRUE ~ hazard_list
+    )
+  ) %>%
+  distinct(study_id, country_list, hazard_list) %>%
+  count(country_list, hazard_list, name = "n_studies")
+
+# Quick check — all unique hazards and their totals after cleaning
+cat("\nUnique hazards after cleaning:\n")
+country_hazard_studies %>%
+  count(hazard_list, wt = n_studies, sort = TRUE) %>%
+  print(n = Inf)
+
+top5_countries <- country_hazard_studies %>%
+  group_by(country_list) %>%
+  summarise(total = sum(n_studies), .groups = "drop") %>%
+  arrange(desc(total)) %>%
+  slice_head(n = 5) %>%
+  pull(country_list)
+
+cat("\nTop 5 countries:\n")
+print(top5_countries)
+
+top5_hazard_data <- country_hazard_studies %>%
+  filter(country_list %in% top5_countries) %>%
+  
+  group_by(country_list) %>%
+  mutate(
+    total_country = sum(n_studies),
+    pct           = round(100 * n_studies / total_country, 1)
+  ) %>%
+  ungroup() %>%
+  
+  # Title-case country label, ordered largest → smallest for facets
+  mutate(
+    country_label = str_to_title(country_list),
+    country_label = factor(
+      country_label,
+      levels = str_to_title(top5_countries)
+    )
+  )
+
+print(top5_hazard_data)
+
+hazard_colors <- c(
+  "climate change"      = "#B3B3B3",
+  "cyclone"             = "#8DA0CB",
+  "drought"             = "#F781BF",
+  "erosion"             = "#E41A1C",
+  "flooding"            = "#377EB8",
+  "hurricane"           = "#4DAF4A",
+  "landslide"           = "#999999",
+  "pollution"           = "#FFD92F",
+  "saltwater intrusion" = "#66C2A5",
+  "sea level rise"      = "#984EA3",
+  "storm surge"         = "#FF7F00",
+  "tsunami"             = "#A65628",
+  "typhoon"             = "#E78AC3",
+  "wave action"         = "#A6D854"
+)
+
+missing_hazards <- setdiff(
+  unique(top5_hazard_data$hazard_list),
+  names(hazard_colors)
+)
+
+if (length(missing_hazards) > 0) {
+  message("Adding colors for unlisted hazards: ",
+          paste(missing_hazards, collapse = ", "))
+  extra_colors <- setNames(
+    colorRampPalette(c("#8DD3C7", "#BEBADA", "#FDB462"))(length(missing_hazards)),
+    missing_hazards
+  )
+  hazard_colors <- c(hazard_colors, extra_colors)
+}
+
+p_hazard_bars <- ggplot(
+  top5_hazard_data,
+  aes(
+    x    = reorder(hazard_list, n_studies),
+    y    = n_studies,
+    fill = hazard_list
+  )
+) +
+  
+  # Bars
+  geom_col(
+    width     = 0.7,
+    color     = "white",
+    linewidth = 0.3
+  ) +
+  
+  # Count + percentage label beyond bar end
+  geom_text(
+    aes(label = paste0(n_studies, " (", pct, "%)")),
+    hjust    = -0.15,
+    size     = 3,
+    fontface = "bold",
+    color    = "grey20"
+  ) +
+  
+  # One panel per country, ordered largest → smallest
+  facet_wrap(
+    ~ country_label,
+    ncol   = 3,
+    scales = "free_y"      # each panel shows only its own hazards
+  ) +
+  
+  coord_flip() +
+  
+  scale_fill_manual(
+    values = hazard_colors,
+    name   = "Hazard Type",
+    labels = function(x) str_to_title(x)
+  ) +
+  
+  # Room for text labels beyond bar
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.30))
+  ) +
+  
+  # Capitalize y-axis hazard labels (after coord_flip)
+  scale_x_discrete(
+    labels = function(x) str_to_title(x)
+  ) +
+  
+  labs(
+    title    = "Hazard Frequency in Top 5 Countries",
+    subtitle = paste0(
+      "Bar length = number of studies per hazard type  |  ",
+      "Multi-hazard and multi-country studies counted in each category"
+    ),
+    x        = NULL,
+    y        = "Number of Studies"
+  ) +
+  
+  theme_lit() +
+  theme(
+    plot.title       = element_text(face = "bold", hjust = 0.5, size = 14),
+    plot.subtitle    = element_text(hjust = 0.5,   size  = 9,  color = "grey40"),
+    plot.caption     = element_text(hjust = 0.5,   size  = 7,  color = "grey60"),
+    strip.text       = element_text(face = "bold", size  = 10),
+    strip.background = element_rect(fill = "grey92", color = "grey70"),
+    axis.text.y      = element_text(size = 8),
+    axis.text.x      = element_text(size = 8),
+    axis.title.x     = element_text(size = 9, color = "grey30"),
+    legend.position  = "none",        # hazard names already on axis
+    panel.spacing    = unit(1.2, "lines"),
+    plot.margin      = margin(10, 15, 10, 10)
+  )
+
+print(p_hazard_bars)
+
+# Global North and Global South Calculations 
+# Define Global North vs Global South classification
+global_classification <- tribble(
+  ~region,          ~global_category,
+  "North America",  "Global North",
+  "Europe",         "Global North",
+  "Oceania",        "Global North",  # Australia & New Zealand are Global North
+  "Asia",           "Mixed",         # Contains both (Japan, S. Korea vs others)
+  "South America",  "Global South",
+  "Africa",         "Global South",
+  "Caribbean",      "Global South",
+  "Middle East",    "Mixed",         # Contains both (Gulf states vs others)
+  "Other",          "Unknown"
+)
+
+# For more precise classification, define specific Global North countries
+global_north_countries <- c(
+  # North America
+  "united states of america", "usa", "canada",
+  # Europe (all listed)
+  "uk", "united kingdom", "france", "germany", "spain", "italy", "portugal",
+  "netherlands", "the netherlands", "belgium", "denmark", "sweden", "norway",
+  "finland", "poland", "greece", "ireland", "switzerland", "austria", "iceland",
+  # Oceania developed
+  "australia", "new zealand",
+  # Asia developed
+  "japan", "south korea", "singapore", "taiwan",
+  # Middle East developed
+  "israel", "saudi arabia", "united arab emirates", "qatar", "kuwait", "bahrain"
+)
+
+# Classify each country
+country_global_classification <- country_studies_with_region %>%
+  mutate(
+    global_category = case_when(
+      tolower(country_list) %in% global_north_countries ~ "Global North",
+      region %in% c("South America", "Africa", "Caribbean") ~ "Global South",
+      TRUE ~ "Global South"  # Default for remaining countries
+    )
+  )
+
+# Calculate totals by Global North/South
+global_totals <- country_global_classification %>%
+  group_by(global_category) %>%
+  summarise(
+    total_studies = sum(n_studies),
+    n_countries = n(),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_studies))
+
+print("=" %>% rep(60) %>% paste(collapse = ""))
+print("GLOBAL NORTH vs GLOBAL SOUTH DISTRIBUTION")
+print("=" %>% rep(60) %>% paste(collapse = ""))
+print(global_totals)
+
+# Calculate percentage
+global_totals <- global_totals %>%
+  mutate(
+    percentage = round(100 * total_studies / sum(total_studies), 1)
+  )
+
+print("\nWith percentages:")
+print(global_totals)
+
+# Visualization: Pie chart
+p_global_pie <- global_totals %>%
+  ggplot(aes(x = "", y = total_studies, fill = global_category)) +
+  geom_col(width = 1, color = "white", linewidth = 1) +
+  coord_polar("y", start = 0) +
+  geom_text(
+    aes(label = paste0(global_category, "\n", total_studies, " studies\n(", percentage, "%)")),
+    position = position_stack(vjust = 0.5),
+    size = 4,
+    fontface = "bold"
+  ) +
+  scale_fill_manual(
+    values = c("Global North" = "#2171B5", "Global South" = "#FC8D62")
+  ) +
+  labs(
+    title = "Global Distribution of Coastal Risk Perception Studies",
+    subtitle = "Global North vs Global South"
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 14),
+    plot.subtitle = element_text(hjust = 0.5, size = 11, color = "grey40"),
+    legend.position = "none"
+  )
+
+print(p_global_pie)
+
+# Bar chart alternative
+p_global_bar <- global_totals %>%
+  ggplot(aes(x = reorder(global_category, total_studies), y = total_studies, fill = global_category)) +
+  geom_col(alpha = 0.85, show.legend = FALSE) +
+  geom_text(aes(label = paste0(total_studies, " (", percentage, "%)")), 
+            hjust = -0.1, size = 4.5, fontface = "bold") +
+  coord_flip() +
+  scale_fill_manual(values = c("Global North" = "#2171B5", "Global South" = "#FC8D62")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title = "Studies by Global Region Classification",
+    subtitle = paste0("Total: ", sum(global_totals$total_studies), " studies across ", 
+                      sum(global_totals$n_countries), " countries"),
+    x = NULL,
+    y = "Number of Studies"
+  ) +
+  theme_lit() +
+  theme(
+    plot.title = element_text(face = "bold", size = 14),
+    axis.text.y = element_text(size = 12, face = "bold")
+  )
+
+print(p_global_bar)
+
+# Keyword frequency bar chart
+kw_freq <- count_split(data, "Keywords") %>%
+  slice_head(n = 20)
+
+p_kw <- ggplot(kw_freq, aes(x = reorder(term, n), y = n)) +
+  geom_col(fill = "#9467BD", alpha = 0.85) +
+  coord_flip() +
+  labs(
+    title    = "Top 20 Keywords by Frequency",
+    x        = NULL,
+    y        = "Frequency"
+  ) +
+  theme_lit(base_size = 9)
+
+print(p_kw)
+
+```
+
